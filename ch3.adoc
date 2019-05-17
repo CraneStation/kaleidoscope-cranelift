@@ -1,0 +1,586 @@
+= Implementing the Code Generation
+
+In this chapter, we'll generate Cranelift IR (intermediate
+representation). This is the first step towards generate a JIT
+compiler with Cranelift.
+
+== Code Generation Setup
+
+This chapter will require a few new dependencies, so please add them:
+
+[source,toml]
+.Cargo.toml
+----
+[dependencies]
+cranelift = "0.30"
+cranelift-module = "0.30"
+cranelift-simplejit = "0.30"
+target-lexicon = "0.3.0"
+----
+
+We'll create a structure that will contain the necessary objects used
+for code generation.
+
+[source,rust]
+.src/gen.rs
+----
+use std::collections::HashMap;
+
+use cranelift_module::Module;
+use cranelift_simplejit::{SimpleJITBackend, SimpleJITBuilder};
+
+pub struct Generator {
+    builder_context: FunctionBuilderContext,
+    functions: HashMap<String, CompiledFunction>,
+    module: Module<SimpleJITBackend>,
+    variable_builder: VariableBuilder,
+}
+
+impl Generator {
+    pub fn new() -> Self {
+        Self {
+            builder_context: FunctionBuilderContext::new(),
+            functions: HashMap::new(),
+            module: Module::new(SimpleJITBuilder::new()),
+            variable_builder: VariableBuilder::new(),
+        }
+    }
+}
+----
+
+The `builder_context` is a `cranelift` structure used to generate the
+code of a series of functions: it's used internally by `cranelift` to
+reduce memory allocations.
+The `functions` attribute will contain the compiled functions in order
+to be able to call them when we'll see a function call expression.
+The `module` attribute is a `cranelift` object that is used to declare
+and define functions.
+The `VariableBuilder` is a simple wrapper of our own to create unique
+variables:
+
+[source,rust]
+.src/gen.rs
+----
+use cranelift::prelude::{EntityRef, FunctionBuilder, Value, Variable, types};
+
+struct VariableBuilder {
+    index: usize,
+}
+
+impl VariableBuilder {
+    fn new() -> Self {
+        Self {
+            index: 0,
+        }
+    }
+
+    fn create_var(&mut self, builder: &mut FunctionBuilder, value: Value) -> Variable {
+        let variable = Variable::new(self.index);
+        builder.declare_var(variable, types::F64);
+        self.index += 1;
+        builder.def_var(variable, value);
+        variable
+    }
+}
+----
+
+Different variables in `cranelift` requires a unique number, so this
+`VariableBuilder` helps us to create variables with unique index.
+
+The other object used is defined as such:
+
+[source,rust]
+.src/gen.rs
+----
+use cranelift_module::FuncId;
+
+struct CompiledFunction {
+    defined: bool,
+    id: FuncId,
+    param_count: usize,
+}
+----
+
+The `defined` attribute will be used to specify whether a declared
+function was defined: this will be used to detect duplicate function
+definitions.
+A function defined in `cranelift` has an identifier that we'll store
+in `id`.
+And `param_count` will be used to detect if we call a function with
+the wrong number of arguments.
+
+== Expression Code Generation
+
+A common pattern in `cranelift` is to have a structure as such to do
+the code generation of a function:
+
+[source,rust]
+.src/gen.rs
+----
+pub struct FunctionGenerator<'a> {
+    builder: FunctionBuilder<'a>,
+    functions: &'a HashMap<String, CompiledFunction>,
+    module: &'a mut Module<SimpleJITBackend>,
+    values: HashMap<String, Variable>,
+}
+----
+
+The `builder` attribute is used to add instructions to a function.
+
+Let's start the code generation of a expression with numbers:
+
+[source,rust]
+.src/gen.rs
+----
+use cranelift::prelude::FloatCC;
+use cranelift::codegen::ir::InstBuilder;
+
+use crate::ast::{BinaryOp, Expr};
+use crate::error::Result;
+use crate::error::Error::*;
+
+impl<'a> FunctionGenerator<'a> {
+    fn expr(&mut self, expr: Expr) -> Result<Value> {
+        let value =
+            match expr {
+                Expr::Number(num) => self.builder.ins().f64const(num),
+                // ...
+----
+
+Since Kaleidoscope only supports floating-point number, we generate
+the code to create a `f64` value by calling `f64const()`.
+
+Kaleidoscope only supports variable defined by function parameters.
+Let's generate the code to create a value from a variable:
+
+[source,rust]
+.src/gen.rs
+----
+                Expr::Variable(name) => {
+                    match self.values.get(&name) {
+                        Some(&variable) => self.builder.use_var(variable),
+                        None => return Err(Undefined("variable")),
+                    }
+                },
+                // ...
+----
+
+Here, we try to get the value from the variable name and then we call
+`use_var()` to get a value from a variable.
+Otherwise, we return an error.
+
+The code generation of binary operations is a bit more complicated:
+
+[source,rust]
+.src/gen.rs
+----
+                Expr::Binary(op, left, right) => {
+                    let left = self.expr(*left)?;
+                    let right = self.expr(*right)?;
+                    match op {
+                        BinaryOp::Plus => self.builder.ins().fadd(left, right),
+                        BinaryOp::Minus => self.builder.ins().fsub(left, right),
+                        BinaryOp::Times => self.builder.ins().fmul(left, right),
+                        BinaryOp::LessThan => {
+                            let boolean = self.builder.ins().fcmp(FloatCC::LessThan, left, right);
+                            let int = self.builder.ins().bint(types::I32, boolean);
+                            self.builder.ins().fcvt_from_sint(types::F64, int)
+                        },
+                    }
+                },
+                // ...
+----
+
+We first generate the code for the left operand and then the right
+operand.
+After that, we'll generate the corresponding instructions depending on
+the operation.
+For `+`, it is `fadd()` and it is similar for `-` and `*`.
+For `<`, it requires more instruction:
+we first compare the value with `fcmp()` specifying the `LessThan`
+operator.
+This returns a value of type `b1` (which represents a boolean) that we
+convert to an `i32` value with the `bint()` function.
+We then need to generate the code to convert this integer to a `f64`
+because it's the only type our language supports.
+
+The only other expression we support for now is the function call:
+
+[source,rust]
+.src/gen.rs
+----
+                Expr::Call(name, args) => {
+                    match self.functions.get(&name) {
+                        Some(func) => {
+                            if func.param_count != args.len() {
+                                return Err(WrongArgumentCount);
+                            }
+                            let local_func = self.module.declare_func_in_func(func.id, &mut self.builder.func);
+                            let arguments: Result<Vec<_>> = args.into_iter().map(|arg| self.expr(arg)).collect();
+                            let arguments = arguments?;
+                            let call = self.builder.ins().call(local_func, &arguments);
+                            self.builder.inst_results(call)[0]
+                        },
+                        None => return Err(Undefined("function")),
+                    }
+                },
+            };
+        Ok(value)
+    }
+}
+----
+
+We first check that the function exists and then we check if the right
+number of arguments were specified.
+After that, we call `declare_func_in_func()` in other to get a
+reference to another function.
+Then, we generate the code of the arguments by recursively calling
+`expr()` for every argument.
+Finally, we generate the call instruction by calling `call()` which
+takes the function reference and the argument values and we generate
+the code to return the first value returned by the call instruction.
+
+== Function Code Generation
+
+First, we need to do the code generation of function prototype:
+
+[source,rust]
+.src/gen.rs
+----
+use cranelift::prelude::{AbiParam, FunctionBuilderContext};
+use cranelift_module::Linkage;
+
+use crate::ast::{Function, Prototype};
+
+impl Generator {
+    pub fn prototype(&mut self, prototype: Prototype, linkage: Linkage) -> Result<FuncId> {
+        let function_name = prototype.function_name;
+        let parameters = &prototype.parameters;
+        match self.functions.get(&function_name) {
+            None => {
+                let mut signature = self.module.make_signature();
+                for _parameter in parameters {
+                    signature.params.push(AbiParam::new(types::F64));
+                }
+                signature.returns.push(AbiParam::new(types::F64));
+    // ...
+----
+
+We check if the function is defined and if it's not the case, we
+create a signature to specify that all parameters are `f64` as well as
+the return value.
+
+[source,rust]
+.src/gen.rs
+----
+                let id = self.module.declare_function(&function_name, linkage, &signature)?;
+                self.functions.insert(function_name.to_string(), CompiledFunction {
+                    defined: false,
+                    id,
+                    param_count: parameters.len(),
+                });
+                Ok(id)
+            },
+----
+
+After that, we can declare the function in the `cranelift` module with
+the specified linkage and signature.
+The linkages we'll use are `Export` and `Import`:
+`Import` means that we declare a function imported from somewhere else
+(for instance `sin` from `libm`) and `Export` means we declare a
+function in the module and it will be accessible from the outside.
+Then, we save the function id and its number of parameters in the
+`functions` attribute.
+
+If we can find the function, we'll do a few checks to make it's not
+already defined and if the same number of parameters are specified:
+
+[source,rust]
+.src/gen.rs
+----
+            Some(function) => {
+                if function.defined {
+                    return Err(FunctionRedef);
+                }
+                if function.param_count != parameters.len() {
+                    return Err(FunctionRedefWithDifferentParams);
+                }
+                Ok(function.id)
+            },
+        }
+    }
+----
+
+Finally, let's do the code generation of a function:
+
+[source,rust]
+.src/gen.rs
+----
+    pub fn function(&mut self, function: Function) -> Result<fn() -> f64> {
+        let mut context = self.module.make_context();
+        let signature = &mut context.func.signature;
+        let parameters = &function.prototype.parameters;
+        for _parameter in parameters {
+            signature.params.push(AbiParam::new(types::F64));
+        }
+        signature.returns.push(AbiParam::new(types::F64));
+        // ...
+----
+
+First, we create a context: it's an object that holds the state for
+the code generation of a function: it is separated from `Module`
+to allow parallel compilation.
+Then, we specify the signature of the function we're currently
+generating.
+
+[source,rust]
+.src/gen.rs
+----
+        let function_name = function.prototype.function_name.to_string();
+        let func_id = self.prototype(&function.prototype, Linkage::Export)?;
+        // ...
+----
+
+Here, we save the function name for later use and we generate the
+prototype.
+
+Then, the fun starts:
+
+[source,rust]
+.src/gen.rs
+----
+        let mut builder = FunctionBuilder::new(&mut context.func, &mut self.builder_context);
+        let entry_block = builder.create_ebb();
+        builder.append_ebb_params_for_function_params(entry_block);
+        builder.switch_to_block(entry_block);
+        builder.seal_block(entry_block);
+        // ...
+----
+
+Next, we create the builder that we used in the `expr()` method to
+generate instructions and we use it here to create the initial basic
+block of the function.
+`Cranelift` uses extended basic blocks (ebb) which are a series of
+basic blocks that follow certain rules.
+One cool feature of `cranelift` is the basic block parameters: we'll
+use them more in the chapter where we'll implement conditions, but for
+now we create them for the function parameters.
+Then, we use `switch_to_block()` to specify where the next
+instructions will go.
+`Cranelift` requires us to seal all basic blocks: sealing means that
+we tell `cranelift` that all the predecessors of the block are known.
+Since this is the entry block, there's no predecessor, but we'll see
+in the chapter about conditions that we don't always call
+`seal_block()` immediately.
+
+[source,rust]
+.src/gen.rs
+----
+        let mut values = HashMap::new();
+        for (i, name) in parameters.iter().enumerate() {
+            let val = builder.ebb_params(entry_block)[i];
+            let variable = self.variable_builder.create_var(&mut builder, val);
+            values.insert(name.clone(), variable);
+        }
+        // ...
+----
+
+Next, we get every parameter from the basic block and we create a
+variable using the variable builder we declared before.
+Then, we save the variable in the `values` `HashMap` for use in the
+`expr()` method later.
+
+After that, we declare our function as defined:
+
+[source,rust]
+.src/gen.rs
+----
+        if let Some(ref mut function) = self.functions.get_mut(&function_name) {
+            function.defined = true;
+        }
+        // ...
+----
+
+This is to do error checking in `prototype()`.
+
+We can now generate the code for the function body:
+
+[source,rust]
+.src/gen.rs
+----
+        let mut generator = FunctionGenerator {
+            builder,
+            functions: &self.functions,
+            module: &mut self.module,
+            values,
+        };
+        let return_value =
+            match generator.expr(function.body) {
+                Ok(value) => value,
+                Err(error) => {
+                    generator.builder.finalize();
+                    self.functions.remove(&function_name);
+                    return Err(error);
+                },
+            };
+        generator.builder.ins().return_(&[return_value]);
+        generator.builder.finalize();
+        println!("{}", context.func.display(None).to_string());
+        // ...
+----
+
+We first create our `FunctionGenerator` structure and then we call
+`expr()` for the function body to get the generated value.
+If there was an error, we remove the function to allow the user to
+redefine it and call `finalize()` to clear the function builder
+context.
+Then, we create the return instruction with the result value of the
+function body.
+After that, we tell the `cranelift` builder that we're done generating
+the code of this function.
+And we show the generate IR of the function.
+
+[source,rust]
+.src/gen.rs
+----
+        self.module.define_function(func_id, &mut context)?;
+        self.module.clear_context(&mut context);
+        self.module.finalize_definitions();
+
+        unsafe {
+            Ok(mem::transmute(self.module.get_finalized_function(func_id)))
+        }
+    }
+----
+
+We define the function in the module which will finish the compilation
+except for relocations.
+Then, we clear the context state and we finalize the definition which
+will do the relocations.
+Finally, we get the pointer to the generated code and cast it to a
+Rust function.
+
+== Driver Changes
+
+We'll declare our module and add a few imports to the main module:
+
+[source,rust]
+.src/main.rs
+----
+mod gen;
+
+use cranelift_module::Linkage;
+
+use gen::Generator;
+----
+
+Right after declaring the parser, we'll declare the code generator:
+
+[source,rust]
+.src/main.rs
+----
+fn main() {
+    // ...
+    let mut parser = Parser::new(lexer);
+    let mut generator = Generator::new();
+    // ...
+----
+
+Finally, we need to call the methods to do the code generation:
+
+[source,rust]
+.src/main.rs
+----
+            Token::Def => {
+                match parser.definition().and_then(|definition| generator.function(definition)) {
+                    Ok(_definition) => (),
+                    Err(error) => {
+                        parser.lexer.next_token()?;
+                        eprintln!("Error: {:?}", error);
+                    },
+                }
+            },
+            Token::Extern => {
+                match parser.extern_().and_then(|prototype| generator.prototype(&prototype, Linkage::Import)) {
+                    Ok(prototype) => println!("{:?}", prototype),
+                    Err(error) => {
+                        parser.lexer.next_token()?;
+                        eprintln!("Error: {:?}", error);
+                    },
+                }
+            },
+            _ => {
+                match parser.toplevel().and_then(|expr| generator.function(expr)) {
+                    Ok(_expr) => (),
+                    Err(error) => {
+                        parser.lexer.next_token()?;
+                        eprintln!("Error: {:?}", error);
+                    },
+                }
+            },
+            // ...
+----
+
+Let's run our project to see the generated code:
+
+[source]
+----
+ready> def foo(a b) a*a + 2*a*b + b*b;
+function u0:0(f64, f64) -> f64 system_v {
+ebb0(v0: f64, v1: f64):
+    v2 = fmul v0, v0
+    v3 = f64const 0x1.0000000000000p1
+    v4 = fmul v3, v0
+    v5 = fmul v4, v1
+    v6 = fadd v2, v5
+    v7 = fmul v1, v1
+    v8 = fadd v6, v7
+    return v8
+}
+----
+
+Here, we declare a function that does a few arithmetic operations.
+
+[source]
+----
+ready> def bar(a) foo(a, 4.0) + bar(31337);
+function u0:0(f64) -> f64 system_v {
+    sig0 = (f64, f64) -> f64 system_v
+    sig1 = (f64) -> f64 system_v
+    fn0 = colocated u0:0 sig0
+    fn1 = colocated u0:1 sig1
+
+ebb0(v0: f64):
+    v1 = f64const 0x1.0000000000000p2
+    v2 = call fn0(v0, v1)
+    v3 = f64const 0x1.e9a4000000000p14
+    v4 = call fn1(v3)
+    v5 = fadd v2, v4
+    return v5
+}
+----
+
+Here, we do a few function calls.
+
+[source]
+----
+ready> extern cos(x);
+funcid3
+ready> cos(1.234);
+function u0:0() -> f64 system_v {
+    sig0 = (f64) -> f64 system_v
+    fn0 = u0:3 sig0
+
+ebb0:
+    v0 = f64const 0x1.3be76c8b43958p0
+    v1 = call fn0(v0)
+    return v1
+}
+----
+
+We declare an external function and call it.
+
+In the next chapter, we'll actually execute this code we just
+generated.
+
+You can find the source code of this chapter https://github.com/CraneStation/kaleidoscope-cranelift/tree/master/ch3[here].
