@@ -1,6 +1,6 @@
 = Introduction
 
-This tutorial will introduce you to write your own programming
+This tutorial will introduce you to writing your own programming
 language using Cranelift as a backend.
 A compiler is usually divided between a frontend and a backend.
 The frontend parses the source language, convert it to an abstract
@@ -104,6 +104,9 @@ Eof
 `Eof` is used to indicate the end of file.
 
 Let's start writing our lexer.
+We'll write our lexer from scratch, but for more complex projects, you
+could use https://github.com/kevinmehall/rust-peg[peg] or
+https://github.com/lalrpop/lalrpop[lalrpop].
 In your new project, create a module `lexer`.
 In this module, we'll define the different tokens that we can have:
 
