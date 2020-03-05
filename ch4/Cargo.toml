@@ -1,0 +1,12 @@
+[package]
+name = "ch4"
+version = "0.1.0"
+authors = ["Antoni Boucher <bouanto@zoho.com>"]
+edition = "2018"
+
+[dependencies]
+cranelift = "0.30"
+cranelift-module = "0.30"
+cranelift-preopt = "0.30"
+cranelift-simplejit = "0.30"
+target-lexicon = "0.3.0"

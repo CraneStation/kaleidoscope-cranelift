@@ -1,0 +1,337 @@
+= Adding JIT Compilation and Optimizations
+
+== Enabling optimizations
+
+For now, `cranelift` provides very few optimizations, but we'll enable
+them anyway to have better code in some cases.
+
+Without optimizations, the generated code is sometimes inefficient:
+
+[source]
+----
+ready> 4+5;
+function u0:0() -> f64 system_v {
+ebb0:
+    v0 = f64const 0x1.0000000000000p2
+    v1 = f64const 0x1.4000000000000p2
+    v2 = fadd v0, v1
+    return v2
+}
+----
+
+We're adding two constant numbers at run-time, but we could have
+easily computed them at compile-time.
+Let's change the code to do that.
+
+We'll create the `SimpleJITBackend` with our own customized target:
+
+[source,rust]
+.src/gen.rs
+----
+use std::str::FromStr;
+
+use cranelift::codegen::settings::Configurable;
+use cranelift::prelude::{isa, settings};
+use target_lexicon::triple;
+
+impl Generator {
+    pub fn new() -> Self {
+        let mut flag_builder = settings::builder();
+        flag_builder.set("opt_level", "best").expect("set optlevel");
+        let isa_builder = isa::lookup(triple!("x86_64-unknown-unknown-elf")).expect("isa");
+        let isa = isa_builder.finish(settings::Flags::new(flag_builder));
+        Self {
+            builder_context: FunctionBuilderContext::new(),
+            functions: HashMap::new(),
+            module: Module::new(SimpleJITBuilder::with_isa(isa)),
+            variable_builder: VariableBuilder::new(),
+        }
+    }
+}
+----
+
+We set the optimization level to the best and we create the target of
+x86_64.
+This do some very basic optimizations mostly related to integer
+arithmetic and branches, so we'll not see them for now.
+
+Let's enable more advanced optimizations.
+This require a new crate:
+
+[source,toml]
+.Cargo.toml
+----
+cranelift-preopt = "0.30"
+----
+
+Using it is very easy.
+We'll update the `function()` method to call the `optimize()`
+function:
+
+[source,rust]
+.src/gen.rs
+----
+use cranelift_preopt::optimize;
+
+impl Generator {
+    pub fn function(&mut self, function: Function) -> Result<fn() -> f64> {
+        // ...
+        generator.builder.ins().return_(&[return_value]);
+        generator.builder.finalize();
+        optimize(&mut context, &*self.module.isa())?;
+        println!("{}", context.func.display(None).to_string());
+
+        self.module.define_function(func_id, &mut context)?;
+        self.module.clear_context(&mut context);
+        self.module.finalize_definitions();
+
+        if function_name.starts_with("__anon_") {
+            self.functions.remove(&function_name);
+        }
+
+        unsafe {
+            Ok(mem::transmute(self.module.get_finalized_function(func_id)))
+        }
+    }
+}
+----
+
+After generating the code of the function, we call `optimize()`.
+And we added a condition before returning to remove the temporary
+anonymous function we create for top-level expressions.
+
+The `optimize()` function returns a new kind of error, so let's handle
+it:
+
+[source,rust]
+.src/error.rs
+----
+use cranelift::codegen::CodegenError;
+
+pub enum Error {
+    CraneliftCodegen(CodegenError),
+    // ...
+}
+
+impl Debug for Error {
+    fn fmt(&self, formatter: &mut Formatter) -> fmt::Result {
+        match *self {
+            CraneliftCodegen(ref error) => error.fmt(formatter),
+            // ...
+        }
+    }
+}
+
+impl From<CodegenError> for Error {
+    fn from(error: CodegenError) -> Self {
+        CraneliftCodegen(error)
+    }
+}
+----
+
+Now, if you run the same code again, it will not do the addition at
+run-time anymore:
+
+[source]
+----
+ready> 4+5;
+function u0:0() -> f64 system_v {
+ebb0:
+    v0 = f64const 0x1.0000000000000p2
+    v1 = f64const 0x1.4000000000000p2
+    v2 = f64const 0x1.2000000000000p3
+    return v2
+}
+----
+
+== Code Execution
+
+Since our `gen` module gives us a Rust function, its very
+straightforward to execute the generate code.
+We just need to call the function:
+
+[source,rust]
+.src/main.rs
+----
+            Token::Def => {
+                match parser.definition().and_then(|definition| generator.function(definition)) {
+                    Ok(_definition) => (),
+                    Err(error) => {
+                        parser.lexer.next_token()?;
+                        eprintln!("Error: {:?}", error);
+                    },
+                }
+            },
+            Token::Extern => {
+                match parser.extern_().and_then(|prototype| generator.prototype(&prototype, Linkage::Import)) {
+                    Ok(prototype) => println!("{}", prototype),
+                    Err(error) => {
+                        parser.lexer.next_token()?;
+                        eprintln!("Error: {:?}", error);
+                    },
+                }
+            },
+            _ => {
+                match parser.toplevel().and_then(|expr| generator.function(expr)) {
+                    Ok(function) => println!("{}", function()),
+                    Err(error) => {
+                        parser.lexer.next_token()?;
+                        eprintln!("Error: {:?}", error);
+                    },
+                }
+            },
+----
+
+Let's also add a function that we'll be able to use in our JIT to
+print a character:
+
+[source,rust]
+.src/main.rs
+----
+#[no_mangle]
+pub extern "C" fn putchard(char: f64) -> f64 {
+    println!("{}", char as u8 as char);
+    0.0
+}
+----
+
+We specify the `#[no_mangle]` attribute and use the C calling
+convention in order to be able to call it easily.
+
+However, if you try to call it, you'll run into an issue:
+
+[source]
+----
+ready> extern putchard(x);
+funcid1
+ready> putchard(101);
+function u0:0() -> f64 system_v {
+    sig0 = (f64) -> f64 system_v
+    fn0 = u0:1 sig0
+
+ebb0:
+    v0 = f64const 0x1.9400000000000p6
+    v1 = call fn0(v0)
+    return v1
+}
+
+thread 'main' panicked at 'can't resolve symbol putchard', ~/.cargo/registry/src/github.com-1ecc6299db9ec823/cranelift-simplejit-0.30.0/src/backend.rs:436:9
+note: Run with `RUST_BACKTRACE=1` environment variable to display a backtrace.
+----
+
+To solve this issue, we'll tell the linker to export all symbols into
+the dynamic symbol table.
+To do so, create a `.cargo/config` file and add the following content:
+
+[source.toml]
+.cargo/config
+----
+[build]
+rustflags = ["-C", "link-args=-rdynamic"]
+----
+
+We'll also explicitly link against `libm` in order to be able to use
+the `cos()` function:
+
+[source,toml]
+.cargo/config
+----
+rustflags = ["-C", "link-args=-rdynamic", "-C", "link-arg=-Wl,--no-as-needed", "-C", "link-arg=-lm"]
+----
+
+Let's define a function and call it:
+
+[source]
+----
+ready> def testfunc(x y) x + y*2;
+function u0:0(f64, f64) -> f64 system_v {
+ebb0(v0: f64, v1: f64):
+    v2 = f64const 0x1.0000000000000p1
+    v3 = fmul v1, v2
+    v4 = fadd v0, v3
+    return v4
+}
+
+ready> testfunc(4, 10);
+function u0:0() -> f64 system_v {
+    sig0 = (f64, f64) -> f64 system_v
+    fn0 = colocated u0:0 sig0
+
+ebb0:
+    v0 = f64const 0x1.0000000000000p2
+    v1 = f64const 0x1.4000000000000p3
+    v2 = call fn0(v0, v1)
+    return v2
+}
+
+24
+----
+
+If you get a panic, please remove the call to `optimize()` since there
+was a https://github.com/CraneStation/cranelift/pull/753[bug] with it.
+
+Now, let's use some functions from `libm`:
+
+[source]
+----
+ready> extern sin(x);
+funcid2
+ready> extern cos(x);
+funcid3
+ready> sin(1.0);
+function u0:0() -> f64 system_v {
+    sig0 = (f64) -> f64 system_v
+    fn0 = u0:2 sig0
+
+ebb0:
+    v0 = f64const 0x1.0000000000000p0
+    v1 = call fn0(v0)
+    return v1
+}
+
+0.8414709848078965
+ready> def foo(x) sin(x)*sin(x) + cos(x)*cos(x);
+function u0:0(f64) -> f64 system_v {
+    sig0 = (f64) -> f64 system_v
+    sig1 = (f64) -> f64 system_v
+    sig2 = (f64) -> f64 system_v
+    sig3 = (f64) -> f64 system_v
+    fn0 = u0:2 sig0
+    fn1 = u0:2 sig1
+    fn2 = u0:3 sig2
+    fn3 = u0:3 sig3
+
+ebb0(v0: f64):
+    v1 = call fn0(v0)
+    v2 = call fn1(v0)
+    v3 = fmul v1, v2
+    v4 = call fn2(v0)
+    v5 = call fn3(v0)
+    v6 = fmul v4, v5
+    v7 = fadd v3, v6
+    return v7
+}
+
+ready> foo(4.0);
+function u0:0() -> f64 system_v {
+    sig0 = (f64) -> f64 system_v
+    fn0 = colocated u0:5 sig0
+
+ebb0:
+    v0 = f64const 0x1.0000000000000p2
+    v1 = call fn0(v0)
+    return v1
+}
+
+1
+----
+
+`Cranelift` is able to find these functions dynamically at run-time as
+it was able to find our `putchard()` function.
+
+This is it, we're now able to compile and execute the code of a very
+simple language.
+The next chapters will add new features to this language to show how
+to generate the code for them.
+
+You can find the source code of this chapter https://github.com/CraneStation/kaleidoscope-cranelift/tree/master/ch4[here].

@@ -1,0 +1,524 @@
+= Introduction
+
+This tutorial will introduce you to writing your own programming
+language using Cranelift as a backend.
+A compiler is usually divided between a frontend and a backend.
+The frontend parses the source language, convert it to an abstract
+syntax tree (AST), do the semantic analysis and convert the AST to an
+intermediate representation.
+The backend takes this intermediate representation and produce
+optimized machine code.
+
+Cranelift is a machine code generator written in Rust and can be used
+to write a just-in-time (JIT) compiler as well as to generate object files.
+
+We'll first write a JIT compiler for the Kaleidoscope language.
+The syntax of this language and the Kaleidoscope code examples come from the
+https://llvm.org/docs/tutorial/index.html[LLVM tutorial].
+Then, we'll transform the JIT compile to an ahead-of-time compiler.
+The resulting compiler has around 1000 lines of code.
+
+== The Kaleidoscope language
+
+Kaleidoscope is a basic language with only one type: 64-bit floating point.
+Thus, it does not need type annotations or type inference which help
+to keep the language simple.
+Here's what it looks like:
+
+[source,python]
+----
+# Compute the x'th fibonacci number.
+def fib(x)
+  if x < 3 then
+    1
+  else
+    fib(x-1)+fib(x-2)
+
+# This expression will compute the 40th number.
+fib(40)
+----
+
+As you can see, it supports comments, functions, conditions and
+arithmetic.
+It can also call external functions as you can see in the following
+example:
+
+[source,python]
+----
+extern sin(arg);
+extern cos(arg);
+extern atan2(arg1 arg2);
+
+atan2(sin(.4), cos(42))
+----
+
+== Implementing the Lexer
+
+The first two chapters of this tutorial will not use Cranelift at all
+since we don't do code generation until the chapter 3.
+The first part of the compiler that we'll need to write is the lexer.
+It does the lexical analysis, which is the phase of the compiler which
+transforms the input source code into a form that will be easier to
+use by the next phase: the parser.
+So instead of having to deal directly with text, the parser will
+receive tokens like `Def` or `Number(3.0)`.
+A token specifies the type of the text it corresponds to and can have
+an associated value attached to it, like in the `Number(3.0)` token
+which has the value `3.0`.
+The first example above will generate the following tokens:
+
+[source]
+----
+Def
+Identifier("fib")
+OpenParen
+Identifier("x")
+CloseParen
+If
+Identifier("x")
+LessThan
+Number(3.0)
+Then
+Number(1.0)
+Else
+Identifier("fib")
+OpenParen
+Identifier("x")
+Minus
+Number(1.0)
+CloseParen
+Plus
+Identifier("fib")
+OpenParen
+Identifier("x")
+Minus
+Number(2.0)
+CloseParen
+Identifier("fib")
+OpenParen
+Number(40.0)
+CloseParen
+Eof
+----
+
+`Eof` is used to indicate the end of file.
+
+Let's start writing our lexer.
+We'll write our lexer from scratch, but for more complex projects, you
+could use https://github.com/kevinmehall/rust-peg[peg] or
+https://github.com/lalrpop/lalrpop[lalrpop].
+In your new project, create a module `lexer`.
+In this module, we'll define the different tokens that we can have:
+
+[source,rust]
+.src/lexer.rs
+----
+#[derive(Debug, PartialEq)]
+pub enum Token {
+    Eof,
+
+    // Commands.
+    Def,
+    Extern,
+
+    // Primary.
+    Identifier(String),
+    Number(f64),
+
+    // Operators.
+    LessThan,
+    Minus,
+    Plus,
+    Star,
+
+    // Other.
+    SemiColon,
+    OpenParen,
+    CloseParen,
+    Comma,
+}
+----
+
+We'll add more tokens in later part of the tutorial when we'll add
+conditions, loops and more to the language.
+
+Our lexer will be a `struct` containing the input source, which is a
+peekable iterator over bytes:
+
+[source,rust]
+.src/lexer.rs
+----
+use std::io::{
+    Bytes,
+    Read,
+};
+use std::iter::Peekable;
+
+pub struct Lexer<R: Read> {
+    bytes: Peekable<Bytes<R>>,
+}
+----
+
+Having an iterator like `Bytes` allows us to have a lexer that will
+work on any input source, be it a file or stdin.
+
+A peekable iterator allows us to look at the next element of the
+iterator without removing the element from the iterator.
+That's very useful for a lexer as well as a parser because we often
+want to decide what to parse first, and then parse it.
+For instance, when we read the character `3`, we want to produce a
+`Number` token, so we'll call the lexer method to read every digits
+from the source and produce a `Number` token which contains a number
+that starts with the digit `3`, which is why it's important not to
+remove it and only peek it instead.
+
+The constructor of the lexer is very simple:
+
+[source,rust]
+.src/lexer.rs
+----
+impl<R: Read> Lexer<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            bytes: reader.bytes().peekable(),
+        }
+    }
+
+    // ...
+----
+
+This transforms a `Read` into the type of iterator that we want.
+
+The next function will decide what kind of token to produce according
+to the character read from the source:
+
+[source,rust]
+.src/lexer.rs
+----
+use crate::error::Result;
+
+// ...
+
+    pub fn next_token(&mut self) -> Result<Token> {
+        if let Some(&Ok(byte)) = self.bytes.peek() {
+            return match byte {
+                b' ' | b'\n' | b'\r' | b'\t' => {
+                    self.bytes.next();
+                    self.next_token()
+                },
+
+                // ...
+----
+
+As you can see, we use pattern matching to detect if the character is
+a white space.
+As you'll see pattern matching is very useful for many parts of a
+compiler.
+So, if the character is a white space, we call `self.bytes.next()` to
+make the iterator consume this character and call `self.next_token()`
+recursively to try to produce a token for the source code that is
+after this space.
+
+If it's not a white space, it can be an identifier, a number or a
+comment:
+
+[source,rust]
+.src/lexer.rs
+----
+                b'a' ..= b'z' | b'A' ..= b'Z' => self.identifier(),
+                b'0' ..= b'9' | b'.' => self.number(),
+                b'#' => self.comment(),
+                // ...
+----
+
+When we see a letter, we call the `identifier()` method which will
+consume as much alphanumeric characters as it can and produce an
+`Identifier` token.
+The same goes for `number()`.
+The `comment()` method will work similarly to white space, meaning
+that it will consume the comment and then call `self.next_token()` to
+actually produce a token.
+
+Here's the rest of this method:
+
+[source,rust]
+.src/lexer.rs
+----
+                _ => {
+                    self.bytes.next();
+                    let token =
+                        match byte {
+                            b'<' => Token::LessThan,
+                            b'+' => Token::Plus,
+                            b'-' => Token::Minus,
+                            b'*' => Token::Star,
+                            b';' => Token::SemiColon,
+                            b',' => Token::Comma,
+                            b'(' => Token::OpenParen,
+                            b')' => Token::CloseParen,
+                            _ => return Err(UnknownChar(byte as char)),
+                        };
+                    Ok(token)
+                },
+            }
+        }
+    }
+}
+----
+
+Here, we consume the character and produce the tokens corresponding to
+a few operators.
+
+If it's neither of these characters, we produce an error of the custom
+type `UnknownChar`.
+
+Let's define the error type that we'll use during all this tutorial.
+Create a new `error` module and create the following error type:
+
+[source,rust]
+.src/error.rs
+----
+use std::io;
+use std::num::ParseFloatError;
+use std::result;
+
+pub type Result<T> = result::Result<T, Error>;
+
+pub enum Error {
+    Io(io::Error),
+    ParseFloat(ParseFloatError),
+    UnknownChar(char),
+}
+----
+
+We can either have an I/O error which comes from reading the source
+file, a float parsing error which will come, as you'll see later, from
+parsing the source code into floating-point numbers or an unknown
+character error which is emitted when the lexer gets a character it
+does not recognize.
+
+We'll also implement a few traits to make error handling easier:
+
+[source,rust]
+.src/error.rs
+----
+use std::fmt::{self, Debug, Formatter};
+
+use self::Error::*;
+
+impl Debug for Error {
+    fn fmt(&self, formatter: &mut Formatter) -> fmt::Result {
+        match *self {
+            Io(ref error) => error.fmt(formatter),
+            ParseFloat(ref error) => error.fmt(formatter),
+            UnknownChar(char) => write!(formatter, "unknown char `{}`", char),
+        }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(error: io::Error) -> Self {
+        Io(error)
+    }
+}
+
+impl From<ParseFloatError> for Error {
+    fn from(error: ParseFloatError) -> Self {
+        ParseFloat(error)
+    }
+}
+----
+
+Let's go back to our lexer and add this import statement:
+
+[source,rust]
+.src/lexer.rs
+----
+use crate::error::Error::UnknownChar;
+----
+
+Let's see how to implement the method to produce an `Identifier` token:
+
+[source,rust]
+.src/lexer.rs
+----
+impl<R: Read> Lexer<R> {
+    // ...
+
+    fn identifier(&mut self) -> Result<Token> {
+        let mut ident = String::new();
+        loop {
+            if let Some(char) = self.peek_char()? {
+                if char.is_ascii_alphanumeric() {
+                    self.bytes.next();
+                    ident.push(char);
+                    continue;
+                }
+            }
+            break;
+        }
+
+        // ...
+----
+
+Here, we loop to gather all alphanumeric characters in the `ident`
+variable.
+The rest of the method will produce the appropriate tokens:
+
+[source,rust]
+.src/lexer.rs
+----
+        let token =
+            match ident.as_str() {
+                "def" => Token::Def,
+                "extern" => Token::Extern,
+                _ => Token::Identifier(ident),
+            };
+        Ok(token)
+    }
+
+    // ...
+----
+
+If it's a keyword, return the corresponding tokens; otherwise produce
+the `Identifier` token.
+The previous method calls `self.peek_char()` which is defined as
+follow:
+
+[source,rust]
+.src/lexer.rs
+----
+    fn peek_char(&mut self) -> Result<Option<char>> {
+        if let Some(&Ok(byte)) = self.bytes.peek() {
+            return Ok(Some(byte as char));
+        }
+
+        match self.bytes.next() {
+            Some(Ok(_)) => unreachable!(),
+            Some(Err(error)) => Err(error.into()),
+            None => Ok(None),
+        }
+    }
+
+    // ...
+----
+
+All it does is to return the next byte as a `char` if we can get one
+or an error.
+
+Now, let's see the method to produce a `Number` token:
+
+[source,rust]
+.src/lexer.rs
+----
+    fn number(&mut self) -> Result<Token> {
+        let integral = self.digits()?;
+        if let Some('.') = self.peek_char()? {
+            self.bytes.next();
+            let decimals = self.digits()?;
+             Ok(Token::Number(format!("{}.{}", integral, decimals).parse()?))
+        }
+        else {
+            Ok(Token::Number(integral.parse()?))
+        }
+    }
+
+    // ...
+----
+
+It first calls the `self.digits()` method which consumes as much
+digits as it can.
+Then, it tries to parse a dot and more digits.
+It finally produce the token by calling `str::parse()` to convert to
+`String` into a `f64`.
+
+The previous method calls `self.digits()` which is defined as follow:
+
+[source,rust]
+.src/lexer.rs
+----
+    fn digits(&mut self) -> Result<String> {
+        let mut buffer = String::new();
+        loop {
+            if let Some(char) = self.peek_char()? {
+                if char.is_numeric() {
+                    self.bytes.next();
+                    buffer.push(char);
+                    continue;
+                }
+            }
+            break;
+        }
+
+        Ok(buffer)
+    }
+
+    // ...
+----
+
+It is similar to the `identifier()` method:
+it consumes numerical characters and saves them into a buffer.
+We allow for empty strings to be returned because `.3` and `3.` are
+both valid number literals.
+
+The last method we need for our lexer is the one to consume comments:
+
+[source,rust]
+.src/lexer.rs
+----
+    fn comment(&mut self) -> Result<Token> {
+        loop {
+            if let Some(char) = self.peek_char()? {
+                self.bytes.next();
+                if char == '\n' {
+                    break;
+                }
+            }
+            else {
+                return Ok(Token::Eof);
+            }
+        }
+        self.next_token()
+    }
+}
+----
+
+Here, we consume all characters until a newline or the end of the
+file.
+Then, we call `self.next_token()` to return the token after the
+comment.
+
+Let's write the main file to output the tokens of a source file:
+
+[source,rust]
+.src/main.rs
+----
+mod error;
+mod lexer;
+
+use std::fs::File;
+
+use error::Result;
+use lexer::{Lexer, Token};
+
+fn main() -> Result<()> {
+    let file = File::open("tests/fib.kal")?;
+    let mut lexer = Lexer::new(file);
+    loop {
+        let token = lexer.next_token()?;
+        println!("{:?}", token);
+        if token == Token::Eof {
+            break;
+        }
+    }
+    Ok(())
+}
+----
+
+This open a file and send it to the lexer.
+Then, it loops to print the tokens until the end of the file.
+
+With this in place, we are ready to implement the parser in the next
+chapter.
+
+You can find the source code of this chapter https://github.com/CraneStation/kaleidoscope-cranelift/tree/master/ch1[here].

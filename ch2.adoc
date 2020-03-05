@@ -1,0 +1,661 @@
+= Implementing a Basic Parser
+
+Now that we have a lexer, let's write a parser to produce an abstract
+syntax tree (AST).
+
+== Abstract syntax tree
+
+With only tokens, it's not quite obviously how we would do code
+generation.
+So, what we'll do is yet another transformation of our input.
+A representation that is much more useful for the later phases of a
+compiler is a tree that represents the constructs of our language.
+For instance, the input `2 + 3` will give the following tree:
+
+[source,rust]
+----
+Expr::Binary(BinaryOp::Plus, Expr::Number(2), Expr::Number(3)),
+----
+
+We don't need to include parentheses in this representation: they
+are actually only useful to guide the parsing.
+
+For our AST, we'll first need a type to represents the different
+operators:
+
+[source,rust]
+.src/ast.rs
+----
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum BinaryOp {
+    LessThan,
+    Minus,
+    Plus,
+    Times,
+}
+----
+
+Then we need a type for expressions:
+
+[source,rust]
+.src/ast.rs
+----
+#[derive(Debug)]
+pub enum Expr {
+    Binary(BinaryOp, Box<Expr>, Box<Expr>),
+    Call(String, Vec<Expr>),
+    Number(f64),
+    Variable(String),
+}
+----
+
+We've already seen `Binary` and `Number` which represents respectively
+a binary operation like addition and a literal number.
+`Call` is for a function call: it contains a name and its arguments.
+`Variable` is for a reference to a variable.
+
+In a real compiler, the AST would also contain the type of the
+expressions, but since we only have one type, we don't need this info.
+Also, a real compiler usually intern strings so that a number would be
+stored in the AST instead of the strings directly.
+
+The last part of the AST is for function definitions and `extern`
+declarations:
+
+[source,rust]
+.src/ast.rs
+----
+#[derive(Debug)]
+pub struct Function {
+    pub prototype: Prototype,
+    pub body: Expr,
+}
+
+#[derive(Debug)]
+pub struct Prototype {
+    pub function_name: String,
+    pub parameters: Vec<String>,
+}
+----
+
+== Basic Parsing
+
+We'll write a recursive descent parser, which is composed of mutually
+recursive functions.
+A function will usually check what is the next token, and decide which
+other function to call next to do the parsing.
+For instance, if it sees the `Def` token, it will call the function to
+parse a function definition.
+
+Let's see the type of our parser:
+
+[source,rust]
+.src/parser.rs
+----
+use std::collections::HashMap;
+use std::io::Read;
+
+use crate::ast::BinaryOp;
+use crate::lexer::Lexer;
+
+pub struct Parser<R: Read> {
+    bin_precedence: HashMap<BinaryOp, i32>,
+    index: usize,
+    pub lexer: Lexer<R>,
+}
+----
+
+Here, we have a `HashMap` that contains the precedence of the
+operators.
+The `index` is only used to generate a different name for top-level
+expressions.
+And of course, we have the `lexer` which will give us the tokens.
+
+The constructor is quit simple:
+
+[source,rust]
+.src/parser.rs
+----
+impl<R: Read> Parser<R> {
+    pub fn new(lexer: Lexer<R>) -> Self {
+        let mut bin_precedence = HashMap::new();
+        bin_precedence.insert(BinaryOp::LessThan, 10);
+        bin_precedence.insert(BinaryOp::Plus, 20);
+        bin_precedence.insert(BinaryOp::Minus, 20);
+        bin_precedence.insert(BinaryOp::Times, 40);
+        Self {
+            bin_precedence,
+            index: 0,
+            lexer,
+        }
+    }
+
+    // ...
+----
+
+We initialize the `HashMap` with the precedence of the default
+operators.
+
+First, let's see the method to parse a function definition:
+
+[source,rust]
+.src/parser.rs
+----
+use crate::ast::Function;
+use crate::error::Result;
+use crate::lexer::Token;
+
+// ...
+
+    pub fn definition(&mut self) -> Result<Function> {
+        self.eat(Token::Def)?;
+        let prototype = self.prototype()?;
+        let body = self.expr()?;
+        Ok(Function {
+            body,
+            prototype,
+        })
+    }
+
+    // ...
+----
+
+First, we eat the `Def` token. Eating means that we are expecting this
+token and if it's any other token, return an error.
+Then, we call `self.prototype()` and `self.expr()` to parse the
+function prototype and then the body of the function, which is an
+expression.
+
+The `eat()` method is quite simple:
+
+[source,rust]
+.src/parser.rs
+----
+    fn eat(&mut self, token: Token) -> Result<()> {
+        let current_token = self.lexer.next_token()?;
+        if current_token != token {
+            return Err(Unexpected("token"));
+        }
+        Ok(())
+    }
+}
+----
+
+We first get the next token and then compare it with the expected
+token. We return an error if they are different.
+This uses a new error, so let's change our error module to add it and
+another one that we'll need in this chapter:
+
+[source,rust]
+.src/error.rs
+----
+pub enum Error {
+    Io(io::Error),
+    ParseFloat(ParseFloatError),
+    UnknownChar(char),
+    Undefined(&'static str),
+    Unexpected(&'static str),
+}
+
+impl Debug for Error {
+    fn fmt(&self, formatter: &mut Formatter) -> fmt::Result {
+        match *self {
+            Io(ref error) => error.fmt(formatter),
+            ParseFloat(ref error) => error.fmt(formatter),
+            UnknownChar(char) => write!(formatter, "unknown char `{}`", char),
+            Undefined(msg) => write!(formatter, "undefined {}", msg),
+            Unexpected(msg) => write!(formatter, "unexpected {}", msg),
+        }
+    }
+}
+----
+
+We also added `Undefined`.
+
+Now, let's see how to parse a prototype:
+
+[source,rust]
+.src/parser.rs
+----
+use crate::ast::Prototype;
+
+// ...
+
+    fn prototype(&mut self) -> Result<Prototype> {
+        let function_name = self.ident()?;
+        self.eat(Token::OpenParen)?;
+        let parameters = self.parameters()?;
+        self.eat(Token::CloseParen)?;
+
+        Ok(Prototype {
+            function_name,
+            parameters,
+        })
+    }
+
+    // ...
+----
+
+First, we parse an identifier for the function name and an open
+parenthesis.
+Then, we parse the parameters and the close parenthesis.
+
+Let's see the `ident()` method:
+
+[source,rust]
+.src/parser.rs
+----
+use crate::error::Error::Unexpected;
+
+// ...
+
+    fn ident(&mut self) -> Result<String> {
+        match self.lexer.next_token()? {
+            Token::Identifier(ident) => Ok(ident),
+            _ => Err(Unexpected("token, expecting identifier")),
+        }
+    }
+
+    // ...
+----
+
+It just returns the identifier if one is found, otherwise, it returns
+an error.
+
+Now, let's see of to parse the parameters:
+
+[source,rust]
+.src/parser.rs
+----
+    fn parameters(&mut self) -> Result<Vec<String>> {
+        let mut params = vec![];
+        loop {
+            match *self.lexer.peek()? {
+                Token::Identifier(_) => {
+                    let ident =
+                        match self.lexer.next_token()? {
+                            Token::Identifier(ident) => ident,
+                            _ => unreachable!(),
+                        };
+                    params.push(ident);
+                },
+                _ => break,
+            }
+        }
+        Ok(params)
+    }
+}
+----
+
+Here, we peek to get the next token from the lexer without consuming
+it to consume all the identifiers that we can, without consuming a
+non-identifier.
+
+Let's see this `peek()` method that we used:
+
+[source,rust]
+./src/lexer.rs
+----
+pub struct Lexer<R: Read> {
+    bytes: Peekable<Bytes<R>>,
+    lookahead: Option<Token>,
+}
+
+impl<R: Read> Lexer<R> {
+    pub fn peek(&mut self) -> Result<&Token> {
+        match self.lookahead {
+            Some(ref token) => Ok(token),
+            None => {
+                self.lookahead = Some(self.next_token()?);
+                self.peek()
+            },
+        }
+    }
+}
+----
+
+This required adding the `lookahead` field in the `Lexer` struct.
+In the `peek()` method, we first check if we have a value in this
+field: if we do, we return it; otherwise we get the next token and
+save it in the field. After that, we recursively call the method
+because the field now contains a value, thus it will return it.
+
+We must also update the `next_token()` method to return the token from
+the field if it have one:
+
+[source,rust]
+.src/parser.rs
+----
+    pub fn next_token(&mut self) -> Result<Token> {
+        if let Some(lookahead) = self.lookahead.take() {
+            return Ok(lookahead);
+        }
+        if let Some(&Ok(byte)) = self.bytes.peek() {
+            return match byte {
+                b' ' | b'\n' | b'\r' | b'\t' => {
+                // ...
+----
+
+We call `take()` on the field to empty it, so that the next call to
+`peek()` or `next_token()` will return the next token.
+
+Now that the `prototype()` method is done, it's quite easy to parse an
+`extern` declaration:
+
+[source,rust]
+.src/parser.rs
+----
+    pub fn extern_(&mut self) -> Result<Prototype> {
+        self.eat(Token::Extern)?;
+        self.prototype()
+    }
+
+    // ...
+----
+
+This eats the token and call `self.prototype()`.
+
+Now, let's parse a primary expression, i.e. a number, identifier,
+function call:
+
+[source,rust]
+.src/parser.rs
+----
+use crate::ast::Expr;
+
+// ...
+
+    fn primary(&mut self) -> Result<Expr> {
+        match *self.lexer.peek()? {
+            Token::Number(number) => {
+                self.lexer.next_token()?;
+                Ok(Expr::Number(number))
+            },
+            Token::OpenParen => {
+                self.eat(Token::OpenParen)?;
+                let expr = self.expr()?;
+                self.eat(Token::CloseParen)?;
+                Ok(expr)
+            },
+            Token::Identifier(_) => self.ident_expr(),
+            _ => Err(Unexpected("token when expecting an expression")),
+        }
+    }
+
+    // ...
+----
+
+There's nothing new in here.
+When there's an identifier, it could either be the start of a function
+call or only a variable reference, which is what we parse in the
+following function:
+
+[source,rust]
+.src/parser.rs
+----
+    fn ident_expr(&mut self) -> Result<Expr> {
+        let name = self.ident()?;
+        let ast =
+            match self.lexer.peek()? {
+                Token::OpenParen => {
+                    self.eat(Token::OpenParen)?;
+                    let args = self.args()?;
+                    self.eat(Token::CloseParen)?;
+                    Expr::Call(name, args)
+                },
+                _ => Expr::Variable(name),
+            };
+        Ok(ast)
+    }
+
+    // ...
+----
+
+After parsing the identifier, we lookahead to see whether there is a
+parenthesis. If there is, we parse the arguments and return a function
+call expression.
+Otherwise, it is only a variable.
+
+The argument parsing is straightforward:
+
+[source,rust]
+.src/parser.rs
+----
+    fn args(&mut self) -> Result<Vec<Expr>> {
+        if *self.lexer.peek()? == Token::CloseParen {
+            return Ok(vec![]);
+        }
+        let mut args = vec![self.expr()?];
+        while *self.lexer.peek()? == Token::Comma {
+            self.eat(Token::Comma)?;
+            args.push(self.expr()?);
+        }
+        Ok(args)
+    }
+
+    // ...
+----
+
+Either we have no arguments to parse, or we have at least one
+separated by commas.
+
+== Operator-precedence based parsing.
+
+We'll use another parsing technique to parse expressions with
+operators.
+This technique parses as much operands and operators with the same
+precedence as it can.
+If an operator with a greater precedence is met, we start parsing
+operands and operators with this new precedence.
+When we meet an operator of lower precedence, we stop and the previous
+recursive call will take care of parsing the remaining operands and
+operators with its own precedence.
+
+Let's first see the `expr()` method:
+
+[source,rust]
+.src/parser.rs
+----
+    fn expr(&mut self) -> Result<Expr> {
+        let left = self.primary()?;
+        self.binary_right(0, left)
+    }
+
+    // ...
+----
+
+It first parses a primary expression and then starts the
+operator-precedence parsing with the lowest priority.
+Let's see how this works:
+
+[source,rust]
+.src/parser.rs
+----
+    fn binary_right(&mut self, expr_precedence: i32, left: Expr) -> Result<Expr> {
+        match self.binary_op()? {
+            Some(op) => {
+                let token_precedence = self.precedence(op)?;
+                if token_precedence < expr_precedence {
+                    Ok(left)
+                }
+                // ...
+----
+
+We first parse a binary operator and then we check its precedence.
+If it is lower than the current precedence, we don't continue parsing
+and we return the expression that we got from the parameter.
+
+[source,rust]
+.src/parser.rs
+----
+                else {
+                    self.lexer.next_token()?; // Eat binary operator.
+                    let right = self.primary()?;
+                    let right =
+                        match self.binary_op()? {
+                            Some(op) => {
+                                if token_precedence < self.precedence(op)? {
+                                    self.binary_right(token_precedence + 1, right)?
+                                }
+                                else {
+                                    right
+                                }
+                            },
+                            None => right,
+                        };
+                    let left = Expr::Binary(op, Box::new(left), Box::new(right));
+                    self.binary_right(expr_precedence, left)
+                }
+----
+
+If the precedence is greater than or equal to the current one, we
+continue parsing, so we get a new operand and then we check if the
+next operator has a higher priority. If it is the case, we recursively
+call `self.binary_right()` with the precedence of the previous
+operator plus 1. Otherwise, we use the primary expression normally and
+recursively call `self.binary_right()` with the current precedence.
+
+This calls a few methods that we'll need to define:
+
+[source,rust]
+.src/parser.rs
+----
+    fn binary_op(&mut self) -> Result<Option<BinaryOp>> {
+        let op =
+            match self.lexer.peek()? {
+                Token::LessThan => BinaryOp::LessThan,
+                Token::Minus => BinaryOp::Minus,
+                Token::Plus => BinaryOp::Plus,
+                Token::Star => BinaryOp::Times,
+                _ => return Ok(None),
+            };
+        Ok(Some(op))
+    }
+
+    // ...
+----
+
+This simply return the AST version of the operator.
+
+[source,rust]
+.src/parser.rs
+----
+use crate::error::Error::Undefined;
+
+// ...
+
+    fn precedence(&self, op: BinaryOp) -> Result<i32> {
+        match self.bin_precedence.get(&op) {
+            Some(&precedence) => Ok(precedence),
+            None => Err(Undefined("operator")),
+        }
+    }
+
+    // ...
+----
+
+And this gets the precedence from our hash map. If we can't find it,
+it's because the operator is not known.
+
+The last method we need to implement is the one that parses top-level
+expressions:
+
+[source,rust]
+.src/parser.rs
+----
+    pub fn toplevel(&mut self) -> Result<Function> {
+        let body = self.expr()?;
+        self.index += 1;
+        Ok(Function {
+            body,
+            prototype: Prototype {
+                function_name: format!("__anon_{}", self.index),
+                parameters: vec![],
+            },
+        })
+    }
+----
+
+This parses an expression and then generate a uniquely-named
+function prototype. We create a prototype so that our JIT will be able
+to call this function to evaluate this top-level expression.
+
+== Driver Changes
+
+Finally, we'll change our main function to parse from stdin and to
+output the AST instead of the tokens:
+
+[source,rust]
+.src/main.rs
+----
+mod ast;
+mod error;
+mod lexer;
+mod parser;
+
+use std::io::{Write, stdin, stdout};
+
+use error::Result;
+use lexer::{Lexer, Token};
+use parser::Parser;
+
+fn main() -> Result<()> {
+    let stdin = stdin();
+    let lexer = Lexer::new(stdin);
+    let mut parser = Parser::new(lexer);
+    print!("ready> ");
+    stdout().flush()?;
+    loop {
+        let token =
+            match parser.lexer.peek() {
+                Ok(ref token) => *token,
+                Err(error) => {
+                    eprintln!("Error: {:?}", error);
+                    continue;
+                },
+            };
+        match token {
+            Token::Eof => break,
+            Token::SemiColon => {
+                parser.lexer.next_token()?;
+                continue;
+            },
+            Token::Def => {
+                match parser.definition() {
+                    Ok(definition) => println!("{:?}", definition),
+                    Err(error) => {
+                        parser.lexer.next_token()?;
+                        eprintln!("Error: {:?}", error);
+                    },
+                }
+            },
+            Token::Extern => {
+                match parser.extern_() {
+                    Ok(prototype) => println!("{:?}", prototype),
+                    Err(error) => {
+                        parser.lexer.next_token()?;
+                        eprintln!("Error: {:?}", error);
+                    },
+                }
+            },
+            _ => {
+                match parser.toplevel() {
+                    Ok(expr) => println!("{:?}", expr),
+                    Err(error) => {
+                        parser.lexer.next_token()?;
+                        eprintln!("Error: {:?}", error);
+                    },
+                }
+            },
+        }
+        print!("ready> ");
+        stdout().flush()?;
+    }
+    Ok(())
+}
+----
+
+With this in place, we are now ready to do the code generation in the
+next chapter.
+
+You can find the source code of this chapter https://github.com/CraneStation/kaleidoscope-cranelift/tree/master/ch2[here].
