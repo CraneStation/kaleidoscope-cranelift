@@ -262,6 +262,12 @@ Here's the rest of this method:
                 },
             }
         }
+
+        match self.bytes.next() {
+            Some(Ok(_)) => unreachable!(),
+            Some(Err(error)) => Err(error.into()),
+            None => Ok(Token::Eof),
+        }
     }
 }
 ----
